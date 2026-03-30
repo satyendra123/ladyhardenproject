@@ -1,151 +1,171 @@
-from pathlib import Path
-import json
 import time
+
 import pyodbc
 import serial
 
-BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = (BASE_DIR / ".." / "Database" / "HXData.mdb").resolve()
-STATE_PATH = BASE_DIR / "bridge-state.json"
-PORT_NAME = "COM4"
-POLL_SECONDS = 0.1
-CLEAR_SECONDS = 5
+COM_PORT = "COM4"
+BAUD_RATE = 9600
+POLL_SECONDS = 5
 SHOW_FORMAT = "|C|{id}|4|1|28-0-#{data}|"
-CLEAR_FORMAT = "|C|{id}|6|"
-DISPLAY_BY_CONTROL = {1: "id1", 2: "id2", 3: "id3", 4: "id4"}
-DISPLAY_BY_IP = {
-    "192.168.0.138": "id1",
-    "192.168.0.107": "id2",
-    "192.168.0.103": "id3",
-    "192.168.0.145": "id4",
-}
-
 
 def get_db_connection():
-    return pyodbc.connect(
-        f"DRIVER={{Microsoft Access Driver (*.mdb, *.accdb)}};DBQ={DB_PATH};Exclusive=0;READONLY=1;",
-        autocommit=True,
+    connection_string = (
+        "DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};"
+        r"DBQ=C:\Program Files (x86)\Access\Access control system 2011\Database\HXData.mdb;"
+        "Exclusive=0;"
+        "READONLY=1;"
     )
+    return pyodbc.connect(connection_string, autocommit=True)
 
 
 def get_serial_connection():
-    return serial.Serial(PORT_NAME, 9600, timeout=0.1, write_timeout=0.1)
+    return serial.Serial(COM_PORT, BAUD_RATE, timeout=0.5)
 
 
-if __name__ == "__main__":
-    conn = get_db_connection()
+def fetch_latest_event(cursor):
+    sql = """
+SELECT TOP 1
+    v.EventID,
+    v.EventTime,
+    v.CardNo,
+    v.ControlID,
+    v.DoorID,
+    v.EventType,
+    v.Event AS EventName,
+    v.DoorName,
+    v.Name AS GateName,
+    c.IP AS ControllerIp,
+    e.EmployeeName,
+    e.Car AS VehicleNumber
+FROM (VEvent AS v
+LEFT JOIN TEmployee AS e ON v.CardNo = e.CardNo)
+LEFT JOIN TControl AS c ON v.ControlID = c.ControlID
+ORDER BY v.EventID DESC
+"""
+    row = cursor.execute(sql).fetchone()
+    if not row:
+        return None
+
+    columns = [column[0] for column in cursor.description]
+    return {columns[index]: row[index] for index in range(len(columns))}
+
+
+def event_signature(event):
+    return (
+        "" if event.get("EventID") is None else str(event.get("EventID")).strip(),
+        "" if event.get("EventTime") is None else str(event.get("EventTime")).strip(),
+        "" if event.get("CardNo") is None else str(event.get("CardNo")).strip(),
+        "" if event.get("DoorID") is None else str(event.get("DoorID")).strip(),
+        "" if event.get("ControlID") is None else str(event.get("ControlID")).strip(),
+    )
+
+
+def resolve_display_id(event):
+    gate_name = "" if event.get("GateName") is None else str(event.get("GateName")).strip()
+    door_name = "" if event.get("DoorName") is None else str(event.get("DoorName")).strip()
+
+    gate_digits = "".join(ch for ch in gate_name if ch.isdigit())
+    door_digits = "".join(ch for ch in door_name if ch.isdigit())
+
+    if gate_digits:
+        return gate_digits
+    if door_digits:
+        return door_digits
+    return ""
+
+
+def print_event(prefix, event, display_id):
+    print(
+        prefix,
+        "| event id:",
+        ("" if event.get("EventID") is None else str(event.get("EventID")).strip()) or "-",
+        "| time:",
+        ("" if event.get("EventTime") is None else str(event.get("EventTime")).strip()) or "-",
+        "| event:",
+        ("" if event.get("EventName") is None else str(event.get("EventName")).strip()) or "-",
+        "| gate:",
+        ("" if event.get("GateName") is None else str(event.get("GateName")).strip()) or "-",
+        "| door:",
+        ("" if event.get("DoorName") is None else str(event.get("DoorName")).strip()) or "-",
+        "| card:",
+        ("" if event.get("CardNo") is None else str(event.get("CardNo")).strip()) or "-",
+        "| employee:",
+        ("" if event.get("EmployeeName") is None else str(event.get("EmployeeName")).strip()) or "-",
+        "| vehicle:",
+        (
+            ""
+            if event.get("VehicleNumber") is None
+            else str(event.get("VehicleNumber")).replace("|", " ").replace("\r", " ").replace("\n", " ").strip()
+        )
+        or "-",
+        "| ip:",
+        ("" if event.get("ControllerIp") is None else str(event.get("ControllerIp")).strip()) or "-",
+        "| display:",
+        display_id or "-",
+    )
+
+
+def main():
+
     try:
-        ser = get_serial_connection()
+        conn = get_db_connection()
     except Exception as exc:
-        print("serial open error :", exc)
-        conn.close()
-        raise SystemExit(1)
-    clear_at = {}
-
-    if STATE_PATH.exists():
-        try:
-            last_event_id = int(json.loads(STATE_PATH.read_text(encoding="utf-8")).get("LastEventId", 0))
-        except Exception:
-            last_event_id = 0
-    else:
-        row = conn.cursor().execute("SELECT MAX(EventID) FROM TEvent").fetchone()
-        last_event_id = int(row[0] or 0) if row and row[0] is not None else 0
-        STATE_PATH.write_text(json.dumps({"LastEventId": last_event_id}, indent=2), encoding="utf-8")
-
-    print("database :", DB_PATH)
-    print("serial   :", PORT_NAME, "@ 9600")
-    print("start id :", last_event_id)
+        print("database open error :", exc)
+        return
 
     try:
+        #ser = get_serial_connection()
+        ser = 1
+    except Exception as exc:
+        print("serial open error   :", exc)
+        conn.close()
+        return
+
+    cursor = conn.cursor()
+    last_seen_signature = None
+    last_sent_vehicle_by_display = {}
+
+    try:
+        startup_event = fetch_latest_event(cursor)
+        if startup_event:
+            last_seen_signature = event_signature(startup_event)
+            print_event("startup latest", startup_event, resolve_display_id(startup_event))
+        else:
+            print("startup latest | no rows in VEvent")
+
         while True:
-            now = time.time()
-            for display_id, clear_time in list(clear_at.items()):
-                if now >= clear_time:
-                    ser.write(CLEAR_FORMAT.format(id=display_id).encode("ascii", errors="ignore"))
-                    print("clear ->", display_id)
-                    del clear_at[display_id]
-
-            rows = conn.cursor().execute(
-                """
-                SELECT TOP 20
-                    ve.EventID,
-                    ve.EventTime,
-                    ve.CardNo,
-                    ve.DoorID,
-                    ve.ControlID,
-                    ve.Name AS GateName,
-                    ve.DoorName,
-                    ve.Event,
-                    emp.CardNo AS EmployeeCardNo,
-                    emp.EmployeeName,
-                    emp.Car AS VehicleNumber,
-                    ctrl.IP AS ControllerIp
-                FROM
-                    (VEvent AS ve
-                    LEFT JOIN TControl AS ctrl ON ve.ControlID = ctrl.ControlID)
-                    INNER JOIN TEmployee AS emp ON CLng(ve.CardNo) - 100 = CLng(emp.CardNo)
-                WHERE ve.EventID > ?
-                    AND ve.Event <> 'Invalid card'
-                    AND emp.Car IS NOT NULL
-                    AND TRIM(emp.Car) <> ''
-                ORDER BY ve.EventID
-                """,
-                last_event_id,
-            ).fetchall()
-
-            for row in rows:
-                event_id = int(row.EventID or 0)
-                card_no = str(row.CardNo or "").strip()
-                employee_card_no = str(row.EmployeeCardNo or "").strip()
-                control_id = int(row.ControlID or 0)
-                door_id = int(row.DoorID or 0)
-                controller_ip = str(row.ControllerIp or "").strip()
-                gate_name = str(row.GateName or "").strip()
-                door_name = str(row.DoorName or "").strip()
-                event_name = str(row.Event or "").strip()
-                employee_name = str(row.EmployeeName or "").strip()
-                vehicle_number = str(row.VehicleNumber or "").strip()
-
-                display_id = DISPLAY_BY_CONTROL.get(control_id) or DISPLAY_BY_IP.get(controller_ip)
-                print(
-                    "event:",
-                    event_id,
-                    "| gate:",
-                    gate_name,
-                    "| door name:",
-                    door_name or "-",
-                    "| event:",
-                    event_name or "-",
-                    "| event card:",
-                    card_no or "-",
-                    "| emp card:",
-                    employee_card_no or "-",
-                    "| employee:",
-                    employee_name or "-",
-                    "| vehicle:",
-                    vehicle_number or "-",
-                    "| ip:",
-                    controller_ip or "-",
-                    "| door:",
-                    door_id,
-                )
-
-                if display_id:
-                    command = SHOW_FORMAT.format(
-                        id=display_id,
-                        data=vehicle_number.replace("|", " ").replace("\r", " ").replace("\n", " ").strip(),
+            latest_event = fetch_latest_event(cursor)
+            if latest_event:
+                current_signature = event_signature(latest_event)
+                if current_signature != last_seen_signature:
+                    display_id = resolve_display_id(latest_event)
+                    vehicle_number = (
+                        ""
+                        if latest_event.get("VehicleNumber") is None
+                        else str(latest_event.get("VehicleNumber"))
+                        .replace("|", " ")
+                        .replace("\r", " ")
+                        .replace("\n", " ")
+                        .strip()
                     )
-                    ser.write(command.encode("ascii", errors="ignore"))
-                    clear_at[display_id] = time.time() + CLEAR_SECONDS
-                    print("send  ->", display_id, command)
-                elif not display_id:
-                    print("skip  -> display mapping not found")
 
-                last_event_id = event_id
-                STATE_PATH.write_text(json.dumps({"LastEventId": last_event_id}, indent=2), encoding="utf-8")
+                    print_event("new latest", latest_event, display_id)
 
-            if not rows:
-                time.sleep(POLL_SECONDS)
+                    if not display_id:
+                        print("skip       | display id could not be resolved")
+                    elif not vehicle_number:
+                        print("skip       | vehicle number not found for this card")
+                    elif last_sent_vehicle_by_display.get(display_id) == vehicle_number:
+                        print("skip       | same vehicle already sent to this display")
+                    else:
+                        command = SHOW_FORMAT.format(id=display_id, data=vehicle_number)
+                        ser.write(command.encode("ascii", errors="ignore"))
+                        last_sent_vehicle_by_display[display_id] = vehicle_number
+                        print("send       |", display_id, command)
+
+                    last_seen_signature = current_signature
+
+            time.sleep(POLL_SECONDS)
 
     except KeyboardInterrupt:
         print("stopped")
@@ -158,3 +178,7 @@ if __name__ == "__main__":
             conn.close()
         except Exception:
             pass
+
+
+if __name__ == "__main__":
+    main()
